@@ -8,6 +8,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::cast_write::CastWriter;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Header {
     pub version: u32,
@@ -180,6 +182,7 @@ pub enum CastError {
     },
     InvalidPaletteFormat(String),
     InvalidEventFormat(String),
+    InvalidVersion,
     SerializationError(String),
     DeserializationError(String),
 }
@@ -193,6 +196,10 @@ impl fmt::Display for CastError {
             }
             CastError::InvalidPaletteFormat(msg) => write!(f, "Invalid palette format: {}", msg),
             CastError::InvalidEventFormat(msg) => write!(f, "Invalid event format: {}", msg),
+            CastError::InvalidVersion => write!(
+                f,
+                "Invalid version. This only supports the v2 format version for `.cast` files"
+            ),
             CastError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             CastError::DeserializationError(msg) => write!(f, "Deserialization error: {}", msg),
         }
@@ -202,7 +209,13 @@ impl fmt::Display for CastError {
 impl std::error::Error for CastError {}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Event(pub f64, pub EventCode, pub String);
+pub struct Event {
+    pub time: f64,
+    pub code: EventCode,
+    pub data: String,
+    // Just for clarification, this is 1 character after the newline or the byte location of the first character in the event
+    pub byte_location: usize,
+}
 
 #[derive(Debug, Clone)]
 pub enum EventCode {
@@ -252,24 +265,20 @@ impl<'de> Deserialize<'de> for EventCode {
     }
 }
 
-/// `CastEditor` serves as both a maintained path to the file and as the dynamic memory map for egui. The way it works is that it takes in a float between 0 and 1 and maps that to bytes between 0 and the file size. It then reads from that byte selected until it reaches the first newline and then it displays or reads the number of lines requested after that. This editor presumes you're using V2 of the `.cast` file type and thus it expects a JSON header followed by an arbitrary number of newline delimited lines in the format [time, code, data] as shown in the [documentation](https://docs.asciinema.org/manual/asciicast/v2/).
-pub struct CastEditor {
+/// `CastReader` serves as both a maintained path to the file and as the dynamic memory map for egui. The way it works is that it takes in a float between 0 and 1 and maps that to bytes between 0 and the file size. It then reads from that byte selected until it reaches the first newline and then it displays or reads the number of lines requested after that. This editor presumes you're using V2 of the `.cast` file type and thus it expects a JSON header followed by an arbitrary number of newline delimited lines in the format [time, code, data] as shown in the [documentation](https://docs.asciinema.org/manual/asciicast/v2/).
+pub struct CastReader {
     /// Owned path to `.cast` file
     pub file_path: PathBuf,
     /// Owned path to save file
     pub save_path: Option<PathBuf>,
-    /// Header info
-    pub header: Header,
     /// Memory map of the `.cast` file
     mmap: Mmap,
     /// File size for fast computation of location for mmap
     file_size: u64,
-    /// Modification check
-    pub modified: bool,
 }
 
-impl CastEditor {
-    pub fn new(path: PathBuf) -> Self {
+impl CastReader {
+    pub fn new(path: PathBuf) -> Result<(Self, CastWriter), CastError> {
         let file = File::open(&path).expect("Failed to Open File");
         let file_size = file.metadata().expect("Failed to Get File Metadata").len();
         // Create read-only memory map so that we can mitigate loading times
@@ -280,25 +289,25 @@ impl CastEditor {
             .iter()
             .position(|&b| b == b'\n')
             .expect("Invalid file format");
-        let header: Header =
-            serde_json::from_slice(&mmap[..header_end]).expect("Failed to Parse Header");
-        // ! This is bad design and should be fixed later
+        let header: Header = serde_json::from_slice(&mmap[..header_end])
+            .map_err(|e| CastError::DeserializationError(e.to_string()))?;
         if header.version != 2 {
-            panic!("Only version 2 is supported")
+            return Err(CastError::InvalidVersion);
         }
-        Self {
-            file_path: path,
-            save_path: None,
-            header,
-            mmap,
-            file_size,
-            modified: false,
-        }
+        Ok((
+            Self {
+                file_path: path,
+                save_path: None,
+                mmap,
+                file_size,
+            },
+            CastWriter::new(header),
+        ))
     }
 
     /// Gets `n` lines starting after the first encountered newline from `pos` (0.0 to 1.0) mapped to bytes of the file from 0 bytes to the end of the file. As it starts after the first newline the header is automatically excluded
     /// Returns a Vec of Events, where each event is [timestamp, event_code, data]
-    pub fn get_lines(&self, pos: f32, n: usize) -> Vec<Event> {
+    pub fn get_lines(&self, pos: f32, n: usize) -> Result<Vec<Event>, CastError> {
         // Clamp pos between 0 and 1
         let pos = pos.clamp(0.0, 1.0);
 
@@ -316,8 +325,9 @@ impl CastEditor {
                     .iter()
                     .rposition(|&b| b == b'\n')
                     .map(|p| p + 1)
-                    // ! It's a bad idea to return the byte position so change this later
-                    .unwrap_or(byte_pos)
+                    .ok_or_else(|| {
+                        CastError::DeserializationError("No Newlines Found in File".to_string())
+                    })?
             }
         };
 
@@ -340,18 +350,26 @@ impl CastEditor {
         }
 
         // Process all the records at once
-        parse_events(&self.mmap[current_pos..end_pos])
+        Ok(parse_events(&self.mmap[current_pos..end_pos], current_pos))
     }
 }
 
-/// Parse multiple events at once from a byte slice
-fn parse_events(slice: &[u8]) -> Vec<Event> {
+// todo make it to where instead of returning none it returns a deserialization error
+/// Parse multiple events at once from a byte slice with it's relative start position from the beginning of the file
+fn parse_events(slice: &[u8], base_position: usize) -> Vec<Event> {
     let input = std::str::from_utf8(slice).unwrap_or_default();
+    let mut current_line_start = 0;
 
     input
         .lines()
         .filter_map(|line| {
-            // Remove whitespace and skip empty lines
+            // Store the absolute byte position BEFORE any trimming
+            let event_position = base_position + current_line_start;
+
+            // Update position using original line length
+            current_line_start += line.len() + 1; // +1 is necessary here because .lines returns an iterator that separates lines based on newlines and thus removes those characters from the evaluated line so we need to compensate
+
+            // Remove whitespace (including \r) and skip empty lines
             let line = line.trim();
             if line.is_empty() {
                 return None;
@@ -441,7 +459,12 @@ fn parse_events(slice: &[u8]) -> Vec<Event> {
             // Parse the data from the third field by removing surrounding quotes
             let data = parts[2][1..parts[2].len() - 1].to_string();
 
-            Some(Event(timestamp, event_code, data))
+            Some(Event {
+                time: timestamp,
+                code: event_code,
+                data,
+                byte_location: event_position,
+            })
         })
         .collect()
 }

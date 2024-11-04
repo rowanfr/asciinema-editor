@@ -1,17 +1,23 @@
 use eframe::{
-    egui::{self, Color32, Context, RichText, ScrollArea, Ui, Vec2},
+    egui::{
+        self, scroll_area::ScrollBarVisibility, Align2, Color32, Context, Image, RichText, Ui, Vec2,
+    },
     App, Frame,
 };
 use egui_file::FileDialog;
+use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use scroll::FixedScrollbar;
 use std::{ffi::OsStr, path::Path};
 
-mod cast_parsing;
+mod cast_read;
+mod cast_write;
 mod scroll;
 
-use cast_parsing::{CastEditor, Event, EventCode};
+use cast_read::{CastReader, Event, EventCode};
+use cast_write::CastWriter;
 
 // todo: Multiply SCROLL_WIDTH by screen size. Multiply bar length and scroll sensitivity by file length
+// todo: Add general UI scaling depending on some zoom
 const SCROLL_WIDTH: f32 = 20.0;
 const EVENTS_PER_PAGE: usize = 50;
 const COLOR_BOX_VEC: Vec2 = Vec2 { x: 30.0, y: 30.0 };
@@ -22,23 +28,40 @@ fn main() {
     eframe::run_native(
         "Asciinema Editor",
         native_options,
-        Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc)))),
+        Box::new(|cc| {
+            // Gives us image support
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(MyEguiApp::new(cc)))
+        }),
     )
     .expect("eframe failed");
 }
-#[derive(Default)]
-struct MyEguiApp {
-    opened_file: Option<CastEditor>,
+
+struct MyEguiApp<'a> {
+    file_reader: Option<CastReader>,
+    file_writer: Option<CastWriter>,
     open_file_dialog: Option<FileDialog>,
     scroll_position: f32,
+    toasts: Toasts,
+    rendered_video: Option<Image<'a>>,
 }
 
-impl MyEguiApp {
+impl MyEguiApp<'_> {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::default()
+        Self {
+            file_reader: None,
+            file_writer: None,
+            open_file_dialog: None,
+            scroll_position: 0.0,
+            // Initialize toasts with your preferred settings
+            toasts: Toasts::new()
+                .anchor(Align2::LEFT_TOP, (10.0, 30.0))
+                .direction(egui::Direction::TopDown),
+            rendered_video: None,
+        }
     }
     fn render_header(&self, ui: &mut Ui) {
-        if let Some(cast_file) = &self.opened_file {
+        if let Some(cast_file) = &self.file_writer {
             ui.vertical(|ui| {
                 let header = &cast_file.header;
 
@@ -151,36 +174,71 @@ impl MyEguiApp {
         }
     }
 
-    fn render_events(&self, ui: &mut Ui) {
-        if let Some(cast_file) = &self.opened_file {
+    fn render_events(&mut self, ui: &mut Ui) {
+        if let Some(cast_file) = &self.file_reader {
             // Get a specified number of events starting from the scroll position passed into the memory map so that we don't need to have all the file in memory to read and edit it. This makes the editor really fast
-            let events = cast_file.get_lines(self.scroll_position, EVENTS_PER_PAGE);
+            match cast_file.get_lines(self.scroll_position, EVENTS_PER_PAGE) {
+                Ok(events) => {
+                    egui::Grid::new("events_grid")
+                        .num_columns(3)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            // Need enumerated line number for unique IDs for each rendered line
+                            for (
+                                line,
+                                Event {
+                                    time,
+                                    code,
+                                    data,
+                                    byte_location: _,
+                                },
+                            ) in events.iter().enumerate()
+                            {
+                                ui.label(RichText::new(time.to_string()).monospace());
 
-            for Event(timestamp, code, data) in events {
-                ui.horizontal(|ui| {
-                    // These are all monospaced as I find it easier to read large amounts of data
-                    // todo: align these in a grid to make it easier to read
-                    ui.label(RichText::new(timestamp.to_string()).monospace());
+                                let (event_text, color) = match code {
+                                    EventCode::Output => ("output", Color32::GREEN),
+                                    EventCode::Input => ("input", Color32::YELLOW),
+                                    EventCode::Marker => ("marker", Color32::BLUE),
+                                    EventCode::Resize => ("resize", Color32::RED),
+                                };
+                                ui.label(RichText::new(event_text).color(color).monospace());
 
-                    // Color-code different event types to visually distinguish them
-                    let (event_text, color) = match code {
-                        EventCode::Output => ("output", Color32::GREEN),
-                        EventCode::Input => ("input", Color32::YELLOW),
-                        EventCode::Marker => ("marker", Color32::BLUE),
-                        EventCode::Resize => ("resize", Color32::RED),
-                    };
+                                // Create a scrolling area with unique ID for each row
+                                egui::ScrollArea::horizontal()
+                                    .id_salt(line) // Add unique ID for each scroll area
+                                    .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+                                    .show(ui, |ui| {
+                                        ui.add_space(4.0);
+                                        ui.label(RichText::new(data).monospace());
+                                        ui.add_space(4.0);
+                                    });
 
-                    ui.label(RichText::new(event_text).color(color).monospace());
-
-                    ui.label(RichText::new(data).monospace());
-                });
-            }
+                                ui.end_row();
+                            }
+                        });
+                }
+                Err(e) => {
+                    self.toasts.add(Toast {
+                        text: format!("Failed to get event list due to error: {}", e).into(),
+                        kind: ToastKind::Error,
+                        options: ToastOptions::default()
+                            .duration_in_seconds(10.0)
+                            .show_progress(true)
+                            .show_icon(true),
+                        ..Default::default()
+                    });
+                }
+            };
         }
     }
 }
 
-impl App for MyEguiApp {
+impl App for MyEguiApp<'_> {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
+        // Crate provides a convenient interface for showing toast notifications or temporary timed popup notifications
+        self.toasts.show(ctx);
+
         egui::TopBottomPanel::top("options").show(ctx, |ui| {
             // Open button to open a file dialogue window that allows the users to select a `.cast` file
             if (ui.button("Open")).clicked() {
@@ -198,14 +256,33 @@ impl App for MyEguiApp {
             if let Some(dialog) = &mut self.open_file_dialog {
                 if dialog.show(ctx).selected() {
                     if let Some(file) = dialog.path() {
-                        self.opened_file = Some(CastEditor::new(file.to_path_buf()));
+                        match CastReader::new(file.to_path_buf()) {
+                            Ok((cast_reader, cast_writer)) => {
+                                self.file_reader = Some(cast_reader);
+                                self.file_writer = Some(cast_writer);
+                            }
+                            Err(e) => {
+                                self.toasts.add(Toast {
+                                    text: format!("Failed to create Cast Editor: {}", e).into(),
+                                    kind: ToastKind::Error,
+                                    options: ToastOptions::default()
+                                        .duration_in_seconds(10.0)
+                                        .show_progress(true)
+                                        .show_icon(true),
+                                    ..Default::default()
+                                });
+                                // We need to set it to None as if it user opens another file while one's already open and there's an error we don't want to deal with a potentially unusual program state
+                                self.file_reader = None;
+                                self.file_writer = None;
+                            }
+                        }
                     }
                 }
             }
         });
 
         // todo: Check if file size even warrants a scroll bar and use it's size to inform the size of the scroll bar handle exponentially decreasing to a smaller point. Additionally allow a ron file for user settings to control settings such as minimum bar size
-        if self.opened_file.is_some() {
+        if self.file_reader.is_some() {
             egui::TopBottomPanel::top("header").show(ctx, |ui| {
                 self.render_header(ui);
             });
