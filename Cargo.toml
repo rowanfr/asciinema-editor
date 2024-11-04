@@ -1,0 +1,12 @@
+[package]
+name = "asciinema-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dirs = "5.0.1"
+eframe = "0.29.1"
+egui_file = "0.19.0"
+memmap = "0.7.0"
+serde = "1.0.214"
+serde_json = "1.0.132"

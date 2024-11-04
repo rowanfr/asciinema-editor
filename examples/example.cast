@@ -1,0 +1,7 @@
+{"version": 2, "width": 80, "height": 24, "timestamp": 1504467315, "title": "Demo", "env": {"TERM": "xterm-256color", "SHELL": "/bin/zsh"}, "theme": { "fg": "#d0d0d0", "bg": "#212121", "palette": "#151515:#ac4142:#7e8e50:#e5b567:#6c99bb:#9f4e85:#7dd6cf:#d0d0d0:#505050:#ac4142:#7e8e50:#e5b567:#6c99bb:#9f4e85:#7dd6cf:#f5f5f5" }}
+[0.248848, "o", "\u001b[1;31mHello \u001b[32mWorld!\u001b[0m\n"]
+[1.001376, "o", "That was ok\rThis is better."]
+[1.500000, "m", ""]
+[2.143733, "o", "Now... "]
+[4.050000, "r", "80x24"]
+[6.541828, "o", "Bye!"]
