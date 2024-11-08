@@ -4,17 +4,16 @@ use eframe::{
     },
     App, Frame,
 };
-use egui_file::FileDialog;
+use egui_file::{DialogType, FileDialog};
+use egui_float_scroller::FixedScrollbar;
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
-use scroll::FixedScrollbar;
-use std::{ffi::OsStr, path::Path};
+use std::{ffi::OsStr, fs::File, io::BufWriter, path::Path};
 
-mod cast_read;
-mod cast_write;
-mod scroll;
+mod asciicast_egui;
+mod cast;
 
-use cast_read::{CastReader, Event, EventCode};
-use cast_write::CastWriter;
+use asciicast_egui::{Event, EventData, Header};
+use cast::{CastFile, EventPosition};
 
 // todo: Multiply SCROLL_WIDTH by screen size. Multiply bar length and scroll sensitivity by file length
 // todo: Add general UI scaling depending on some zoom
@@ -38,9 +37,8 @@ fn main() {
 }
 
 struct MyEguiApp<'a> {
-    file_reader: Option<CastReader>,
-    file_writer: Option<CastWriter>,
-    open_file_dialog: Option<FileDialog>,
+    cast_file: Option<CastFile>,
+    file_dialog: Option<FileDialog>,
     scroll_position: f32,
     toasts: Toasts,
     rendered_video: Option<Image<'a>>,
@@ -49,9 +47,8 @@ struct MyEguiApp<'a> {
 impl MyEguiApp<'_> {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
-            file_reader: None,
-            file_writer: None,
-            open_file_dialog: None,
+            cast_file: None,
+            file_dialog: None,
             scroll_position: 0.0,
             // Initialize toasts with your preferred settings
             toasts: Toasts::new()
@@ -61,7 +58,7 @@ impl MyEguiApp<'_> {
         }
     }
     fn render_header(&self, ui: &mut Ui) {
-        if let Some(cast_file) = &self.file_writer {
+        if let Some(cast_file) = &self.cast_file {
             ui.vertical(|ui| {
                 let header = &cast_file.header;
 
@@ -175,42 +172,45 @@ impl MyEguiApp<'_> {
     }
 
     fn render_events(&mut self, ui: &mut Ui) {
-        if let Some(cast_file) = &self.file_reader {
+        if let Some(cast_file) = &self.cast_file {
             // Get a specified number of events starting from the scroll position passed into the memory map so that we don't need to have all the file in memory to read and edit it. This makes the editor really fast
             match cast_file.get_lines(self.scroll_position, EVENTS_PER_PAGE) {
                 Ok(events) => {
                     egui::Grid::new("events_grid")
-                        .num_columns(3)
+                        .num_columns(4)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
                             // Need enumerated line number for unique IDs for each rendered line
                             for (
                                 line,
-                                Event {
-                                    time,
-                                    code,
-                                    data,
-                                    byte_location: _,
+                                EventPosition {
+                                    event,
+                                    byte_location,
                                 },
                             ) in events.iter().enumerate()
                             {
-                                ui.label(RichText::new(time.to_string()).monospace());
+                                egui::ComboBox::from_id_salt(format!("button_{}", line))
+                                    .selected_text("Choose...")
+                                    .show_ui(ui, |ui| {
+                                        // todo pass in location
+                                        if ui.button("Insert New Line Before This").clicked() {}
+                                        if ui.button("Delete").clicked() {}
+                                    });
+                                ui.label(RichText::new(event.time.to_string()).monospace());
 
-                                let (event_text, color) = match code {
-                                    EventCode::Output => ("output", Color32::GREEN),
-                                    EventCode::Input => ("input", Color32::YELLOW),
-                                    EventCode::Marker => ("marker", Color32::BLUE),
-                                    EventCode::Resize => ("resize", Color32::RED),
-                                };
-                                ui.label(RichText::new(event_text).color(color).monospace());
+                                ui.label(
+                                    RichText::new(event.data.get_type())
+                                        .color(event.data.get_color())
+                                        .monospace(),
+                                );
 
                                 // Create a scrolling area with unique ID for each row
                                 egui::ScrollArea::horizontal()
-                                    .id_salt(line) // Add unique ID for each scroll area
+                                    .id_salt(format!("data_{}", line)) // Add unique ID for each scroll area
                                     .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
                                     .show(ui, |ui| {
                                         ui.add_space(4.0);
-                                        ui.label(RichText::new(data).monospace());
+                                        ui.label(RichText::new(event.data.get_data()).monospace());
                                         ui.add_space(4.0);
                                     });
 
@@ -240,40 +240,72 @@ impl App for MyEguiApp<'_> {
         self.toasts.show(ctx);
 
         egui::TopBottomPanel::top("options").show(ctx, |ui| {
-            // Open button to open a file dialogue window that allows the users to select a `.cast` file
-            if (ui.button("Open")).clicked() {
-                let filter = Box::new({
-                    |path: &Path| -> bool { path.extension() == Some(OsStr::new("cast")) }
-                });
-                // By default open to the home directory and apply the `.cast` filter
-                let mut file_dialog =
-                    FileDialog::open_file(dirs::home_dir()).show_files_filter(filter);
-                file_dialog.open();
-                self.open_file_dialog = Some(file_dialog);
-            }
+            ui.horizontal(|ui| {
+                // Open button to open a file dialogue window that allows the users to select a `.cast` file
+                if (ui.button("Open")).clicked() {
+                    let filter = Box::new({
+                        |path: &Path| -> bool { path.extension() == Some(OsStr::new("cast")) }
+                    });
+                    // By default open to the home directory and apply the `.cast` filter
+                    let mut file_dialog =
+                        FileDialog::open_file(dirs::home_dir()).show_files_filter(filter);
+                    file_dialog.open();
+                    self.file_dialog = Some(file_dialog);
+                }
 
+                if let Some(file) = self.cast_file.as_ref() {
+                    if (ui.button("Save")).clicked() {
+                        // By default open to the home directory and apply the `.cast` filter
+                        let mut file_dialog = FileDialog::save_file(Some(file.file_path.clone()));
+                        file_dialog.open();
+                        self.file_dialog = Some(file_dialog);
+                    }
+                }
+            });
             // This keeps open the file dialogue throughout egui updates when it has been opened by the open button and returns a opened file path buffer when a file has been selected
-            if let Some(dialog) = &mut self.open_file_dialog {
+            if let Some(dialog) = &mut self.file_dialog {
                 if dialog.show(ctx).selected() {
-                    if let Some(file) = dialog.path() {
-                        match CastReader::new(file.to_path_buf()) {
-                            Ok((cast_reader, cast_writer)) => {
-                                self.file_reader = Some(cast_reader);
-                                self.file_writer = Some(cast_writer);
+                    if let Some(path) = dialog.path() {
+                        match dialog.dialog_type() {
+                            DialogType::SelectFolder => todo!(),
+                            DialogType::OpenFile => {
+                                match CastFile::new(path.to_path_buf()) {
+                                    Ok(cast_file) => {
+                                        self.cast_file = Some(cast_file);
+                                    }
+                                    Err(e) => {
+                                        self.toasts.add(Toast {
+                                            text: format!("Failed to Create Cast Editor: {}", e)
+                                                .into(),
+                                            kind: ToastKind::Error,
+                                            options: ToastOptions::default()
+                                                .duration_in_seconds(10.0)
+                                                .show_progress(true)
+                                                .show_icon(true),
+                                            ..Default::default()
+                                        });
+                                        // We need to set it to None as if it user opens another file while one's already open and there's an error we don't want to deal with a potentially unusual program state
+                                        self.cast_file = None;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                self.toasts.add(Toast {
-                                    text: format!("Failed to create Cast Editor: {}", e).into(),
-                                    kind: ToastKind::Error,
-                                    options: ToastOptions::default()
-                                        .duration_in_seconds(10.0)
-                                        .show_progress(true)
-                                        .show_icon(true),
-                                    ..Default::default()
-                                });
-                                // We need to set it to None as if it user opens another file while one's already open and there's an error we don't want to deal with a potentially unusual program state
-                                self.file_reader = None;
-                                self.file_writer = None;
+                            DialogType::SaveFile => {
+                                if let Some(cast_file) = self.cast_file.as_ref() {
+                                    match cast_file.save_to_file(path) {
+                                        Ok(()) => (),
+                                        Err(e) => {
+                                            self.toasts.add(Toast {
+                                                text: format!("Failed to Save File: {}", e).into(),
+                                                kind: ToastKind::Error,
+                                                options: ToastOptions::default()
+                                                    .duration_in_seconds(10.0)
+                                                    .show_progress(true)
+                                                    .show_icon(true),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -282,20 +314,13 @@ impl App for MyEguiApp<'_> {
         });
 
         // todo: Check if file size even warrants a scroll bar and use it's size to inform the size of the scroll bar handle exponentially decreasing to a smaller point. Additionally allow a ron file for user settings to control settings such as minimum bar size
-        if self.file_reader.is_some() {
+        if self.cast_file.is_some() {
             egui::TopBottomPanel::top("header").show(ctx, |ui| {
                 self.render_header(ui);
             });
 
-            egui::SidePanel::right("Scroll Bar for MMap")
-                .resizable(false)
-                .max_width(SCROLL_WIDTH)
-                .frame(egui::Frame::none()) // Removes the panel's frame (Which removes unwanted spacing between the scroll bar and side panel)
-                .show_separator_line(true) // Keeps the separator line between panels. Default behavior but I'm on the fence about look
-                .show(ctx, |ui| {
-                    // Custom Scroll Widget as we need to map scroll to a f32 position that we can use to determine where in MMap the file should be drawn from
-                    ui.add(FixedScrollbar::new(&mut self.scroll_position, SCROLL_WIDTH));
-                });
+            let scrollbar = FixedScrollbar::new(&mut self.scroll_position);
+            scrollbar.show_in_side_panel(ctx, "Memory Scroller");
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 self.render_events(ui);
