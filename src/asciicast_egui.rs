@@ -203,13 +203,7 @@ impl Serialize for Event {
         };
 
         // Create the formatted string matching the asciinema format
-        let formatted = format!(
-            "[{}, \"{}\", \"{}\"]",
-            self.time,
-            code,
-            // ! Check the data in case of improper serialization
-            data.replace('\"', "\\\"")
-        );
+        let formatted = format!("[{},\"{}\",\"{}\"]", self.time, code, data);
 
         serializer.serialize_str(&formatted)
     }
