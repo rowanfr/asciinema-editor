@@ -13,7 +13,7 @@ mod asciicast_egui;
 mod cast;
 
 use asciicast_egui::{Event, EventData, Header};
-use cast::{CastFile, EventPosition};
+use cast::{CastFile, EventPositioned, ModificationAction};
 
 // todo: Multiply SCROLL_WIDTH by screen size. Multiply bar length and scroll sensitivity by file length
 // todo: Add general UI scaling depending on some zoom
@@ -183,18 +183,32 @@ impl MyEguiApp<'_> {
                             // Need enumerated line number for unique IDs for each rendered line
                             for (
                                 line,
-                                EventPosition {
+                                event_position_window,
+                            ) in events.windows(3).enumerate()
+                            
+                            {
+                                let EventPositioned {
                                     event,
                                     byte_location,
-                                },
-                            ) in events.iter().enumerate()
-                            {
+                                } = &event_position_window[1];
                                 egui::ComboBox::from_id_salt(format!("button_{}", line))
                                     .selected_text("Choose...")
                                     .show_ui(ui, |ui| {
                                         // todo pass in location
-                                        if ui.button("Insert New Line Before This").clicked() {}
-                                        if ui.button("Delete").clicked() {}
+                                        if ui.button("Insert New Line Before This").clicked() {
+                                            self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").add_modification(
+                                                *byte_location,
+                                                0,
+                                                ModificationAction::Addition(Event { time: (event_position_window[0].event.time + event_position_window[2].event.time) / 2.0, data: EventData::Output("".to_string()) }),
+                                            );
+                                        }
+                                        if ui.button("Delete").clicked() {
+                                            self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").add_modification(
+                                                *byte_location,
+                                                0,
+                                                ModificationAction::Deletion,
+                                            );
+                                        }
                                     });
                                 ui.label(RichText::new(event.time.to_string()).monospace());
 
@@ -217,6 +231,8 @@ impl MyEguiApp<'_> {
                                 ui.end_row();
                             }
                         });
+                    // This button will only show up if they have scrolled to the end of the file though it is always appended
+                    if ui.button("Insert New Line").clicked() {}
                 }
                 Err(e) => {
                     self.toasts.add(Toast {

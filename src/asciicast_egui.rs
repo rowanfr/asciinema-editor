@@ -192,20 +192,35 @@ impl Serialize for Event {
     where
         S: Serializer,
     {
-        use EventData::*;
+        use serde::ser::SerializeSeq;
 
-        let (code, data) = match &self.data {
-            Output(data) => ('o', data),
-            Input(data) => ('i', data),
-            Resize(cols, rows) => ('r', &format!("{}x{}", cols, rows)),
-            Marker(data) => ('m', data),
-            Other(code, data) => (*code, data),
+        // Create a sequence serializer for our array
+        let mut seq = serializer.serialize_seq(Some(3))?;
+
+        // Serialize the time
+        seq.serialize_element(&self.time)?;
+
+        // Serialize the event type as a single character string
+        let code = match &self.data {
+            EventData::Output(_) => "o",
+            EventData::Input(_) => "i",
+            EventData::Resize(_, _) => "r",
+            EventData::Marker(_) => "m",
+            EventData::Other(c, _) => &c.to_string(),
         };
+        seq.serialize_element(&code)?;
 
-        // Create the formatted string matching the asciinema format
-        let formatted = format!("[{},\"{}\",\"{}\"]", self.time, code, data);
+        // Serialize the data
+        let data = match &self.data {
+            EventData::Output(data)
+            | EventData::Input(data)
+            | EventData::Marker(data)
+            | EventData::Other(_, data) => data,
+            EventData::Resize(cols, rows) => &format!("{}x{}", cols, rows),
+        };
+        seq.serialize_element(data)?;
 
-        serializer.serialize_str(&formatted)
+        seq.end()
     }
 }
 

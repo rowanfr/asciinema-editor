@@ -3,7 +3,7 @@ use eframe::egui::Color32;
 use memmap::Mmap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt,
     fs::File,
     io::{BufWriter, Write},
@@ -16,13 +16,48 @@ const BLOCK_SIZE: usize = 64 * 1024; // 64KB blocks
 
 #[derive(Debug, Clone)]
 pub enum ModificationAction {
-    Addition(EventPosition),
+    /// Addition prepends is meant to indicate prepending an Event
+    Addition(Event),
+    /// Delete either removes the addition action it's pointed to or the event at the byte location associated with
     Deletion,
-    Modification(EventPosition),
 }
 
+/// `ModificationChain` is used to organize modifications at a given byte location. For the associated modifications vector position 0 should always be for mutation or deletion of the original event and if neither of those actions are there then it should be used for adding events. The order of adding events should be in a manner that is top down or in the general read direction that we want so we can easily and intuitively iterate over this chain
+struct ModificationChain {
+    pub modifications: Vec<ModificationAction>,
+}
+
+impl ModificationChain {
+    fn new() -> Self {
+        Self {
+            modifications: Vec::new(),
+        }
+    }
+
+    // ! This is probably a bad way of doing things, look into refactoring later
+    // todo enable adding chains instead of just individual actions
+    /// Addition action inserts an action into the order specified. Delete action removes any action it points to including, including other deletes, based on order. If the delete is outside the order available and it inserts a delete. Remember that for skipping the line one or more deletes need to be present
+    fn add_action(&mut self, action: ModificationAction, order: usize) {
+        let order = order.clamp(0, self.modifications.len());
+        match &action {
+            ModificationAction::Addition(_) => {
+                self.modifications.insert(order, action);
+            }
+            ModificationAction::Deletion => match self.modifications.get_mut(order) {
+                Some(_) => {
+                    self.modifications.remove(order);
+                }
+                None => {
+                    self.modifications.insert(order, action);
+                }
+            },
+        }
+    }
+}
+
+/// A given event with an associated position for rendering and modification
 #[derive(Debug, Clone)]
-pub struct EventPosition {
+pub struct EventPositioned {
     pub event: Event,
     pub byte_location: usize,
 }
@@ -37,7 +72,7 @@ pub struct CastFile {
     /// File size for fast computation of location for mmap
     file_size: u64,
     // Map of byte_location -> modification action
-    modifications: BTreeMap<usize, ModificationAction>,
+    modifications: BTreeMap<usize, ModificationChain>,
 }
 
 impl CastFile {
@@ -66,13 +101,31 @@ impl CastFile {
         })
     }
 
-    pub fn add_modification(&mut self, byte_location: usize, action: ModificationAction) {
-        self.modifications.insert(byte_location, action);
+    pub fn add_modification(
+        &mut self,
+        byte_location: usize,
+        order: usize,
+        action: ModificationAction,
+    ) {
+        match self.modifications.get_mut(&byte_location) {
+            Some(chain) => {
+                chain.add_action(action, order);
+            }
+            None => {
+                let mut chain = ModificationChain::new();
+                chain.add_action(action, order);
+                self.modifications.insert(byte_location, chain);
+            }
+        }
+    }
+
+    pub fn get_chain(&self, byte_location: usize) -> Option<&ModificationChain> {
+        self.modifications.get(&byte_location)
     }
 
     /// Gets `n` lines starting after the first encountered newline from `pos` (0.0 to 1.0) mapped to bytes of the file from 0 bytes to the end of the file. As it starts after the first newline the header is automatically excluded
     /// Returns a Vec of Events, where each event is [timestamp, event_code, data]
-    pub fn get_lines(&self, pos: f32, n: usize) -> Result<Vec<EventPosition>, CastError> {
+    pub fn get_lines(&self, pos: f32, n: usize) -> Result<Vec<EventPositioned>, CastError> {
         // Clamp pos between 0 and 1
         let pos = pos.clamp(0.0, 1.0);
 
@@ -110,12 +163,61 @@ impl CastFile {
                 }
             }
         }
+        // If fewer newlines found than requested return all we have until the end of the file
         if newlines_found < n {
             end_pos = self.mmap.len();
         }
 
-        // Process all the records at once
-        parse_events(&self.mmap[current_pos..end_pos], current_pos)
+        // Process the range and apply modifications
+        let mut events = Vec::new();
+        let mut mod_iter = self.modifications.range(current_pos..end_pos).peekable();
+
+        while current_pos < end_pos {
+            match mod_iter.peek() {
+                Some((&mod_pos, chain)) if mod_pos == current_pos => {
+                    let next_newline = find_next_newline(&self.mmap, current_pos);
+                    // byte location for all actions before any potential delete action alters it
+                    let byte_location = current_pos;
+                    for action in chain.modifications.iter() {
+                        match action {
+                            ModificationAction::Addition(event) => {
+                                // Add the new event before current position so this is being pre-pended
+                                events.push(EventPositioned {
+                                    event: event.clone(),
+                                    byte_location,
+                                });
+                            }
+                            ModificationAction::Deletion => {
+                                // Skip this line. This makes it to where no matter how many deletes there are they always only skip one line at most
+                                current_pos = next_newline;
+                            }
+                        }
+                    }
+                    mod_iter.next(); // Move to next modification
+                }
+                Some((&mod_pos, _)) => {
+                    // Parse events until the next modification
+                    let parse_end = std::cmp::min(mod_pos, end_pos);
+                    if let Ok(mut parsed_events) =
+                        parse_events(&self.mmap[current_pos..parse_end], current_pos)
+                    {
+                        events.extend(parsed_events);
+                    }
+                    current_pos = parse_end;
+                }
+                None => {
+                    // No more modifications, parse remaining events in range
+                    if let Ok(mut parsed_events) =
+                        parse_events(&self.mmap[current_pos..end_pos], current_pos)
+                    {
+                        events.extend(parsed_events);
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(events)
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), CastError> {
@@ -124,6 +226,7 @@ impl CastFile {
         self.write_modified_file(writer)
     }
 
+    // ! This removes spaces but it can still be read so I'll deal with that later
     fn serialize_event(event: &Event) -> Result<Vec<u8>, CastError> {
         serde_json::to_string(event)
             .map(|s| format!("{}\n", s).into_bytes())
@@ -148,27 +251,19 @@ impl CastFile {
         while current_pos < self.mmap.len() {
             // Check if there's a modification at the current position
             match mod_iter.peek() {
-                Some((&mod_pos, action)) if mod_pos == current_pos => {
-                    match action {
-                        ModificationAction::Addition(event) => {
-                            // Write new event before current line
-                            let serialized = Self::serialize_event(&event.event)?;
-                            writer.write_all(&serialized)?;
-
-                            // Write original line
-                            let line_end = find_next_newline(&self.mmap, current_pos);
-                            writer.write_all(&self.mmap[current_pos..line_end])?;
-                            current_pos = line_end;
-                        }
-                        ModificationAction::Deletion => {
-                            // Skip to next line
-                            current_pos = find_next_newline(&self.mmap, current_pos);
-                        }
-                        ModificationAction::Modification(new_event) => {
-                            // Replace current line with new event
-                            let serialized = Self::serialize_event(&new_event.event)?;
-                            writer.write_all(&serialized)?;
-                            current_pos = find_next_newline(&self.mmap, current_pos);
+                Some((&mod_pos, chain)) if mod_pos == current_pos => {
+                    for action in chain.modifications.iter() {
+                        let next_newline = find_next_newline(&self.mmap, current_pos);
+                        match action {
+                            ModificationAction::Addition(event) => {
+                                // Write new event before current line
+                                let serialized = Self::serialize_event(&event)?;
+                                writer.write_all(&serialized)?;
+                            }
+                            ModificationAction::Deletion => {
+                                // Skip this line. This makes it to where no matter how many deletes there are they always only skip one line at most
+                                current_pos = next_newline;
+                            }
                         }
                     }
                     mod_iter.next(); // Move to next modification
@@ -192,9 +287,8 @@ impl CastFile {
     }
 }
 
-// todo make it to where instead of returning none it returns a deserialization error
 /// Parse multiple events at once from a byte slice with it's relative start position from the beginning of the file
-fn parse_events(slice: &[u8], base_position: usize) -> Result<Vec<EventPosition>, CastError> {
+fn parse_events(slice: &[u8], base_position: usize) -> Result<Vec<EventPositioned>, CastError> {
     let input = std::str::from_utf8(slice)?;
 
     let mut current_position = base_position;
@@ -212,7 +306,7 @@ fn parse_events(slice: &[u8], base_position: usize) -> Result<Vec<EventPosition>
         // Use the existing Serde deserialization
         match serde_json::from_str::<Event>(line) {
             Ok(event) => {
-                events.push(EventPosition {
+                events.push(EventPositioned {
                     event,
                     byte_location: line_start,
                 });
