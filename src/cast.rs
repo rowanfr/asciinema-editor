@@ -7,6 +7,7 @@ use std::{
     fmt,
     fs::File,
     io::{BufWriter, Write},
+    mem,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -18,39 +19,32 @@ const BLOCK_SIZE: usize = 64 * 1024; // 64KB blocks
 pub enum ModificationAction {
     /// Addition prepends is meant to indicate prepending an Event
     Addition(Event),
-    /// Delete either removes the addition action it's pointed to or the event at the byte location associated with
+    /// Delete either removes an addition action or changes the `original_deleted` state
     Deletion,
+    /// Only modify the data, not the time
+    ModifyData(EventData),
 }
 
-/// `ModificationChain` is used to organize modifications at a given byte location. For the associated modifications vector position 0 should always be for mutation or deletion of the original event and if neither of those actions are there then it should be used for adding events. The order of adding events should be in a manner that is top down or in the general read direction that we want so we can easily and intuitively iterate over this chain
-struct ModificationChain {
-    pub modifications: Vec<ModificationAction>,
+/// This represents advanced modification actions which can be thought of as collections of basic modification actions
+#[derive(Debug)]
+pub enum AdvancedModificationAction {
+    /// Modify the current event. Can be thought of as a deletion followed by an addition. This also includes time checking through Addition which ModifyData does not
+    Modify(Event),
+    /// Swaps the position of 2 events with associated order. Can be thought of as 2 deletions followed by 2 additions. This assumes you're using the function `add_advanced_action` to give context as to the current action, and then passing in the location of the other action into this enum.
+    Swap(EventPositioned, usize),
+}
+
+/// `ModificationChain` is used to organize modifications at a given byte location. It works by holding a value to check whether or not to render the original and a vector of Events which are the modifications. These modifications are prepended to the memory mapped event they normally point to in implementation.
+pub struct ModificationChain {
+    pub modifications: Vec<Event>,
+    original_deleted: bool,
 }
 
 impl ModificationChain {
     fn new() -> Self {
         Self {
             modifications: Vec::new(),
-        }
-    }
-
-    // ! This is probably a bad way of doing things, look into refactoring later
-    // todo enable adding chains instead of just individual actions
-    /// Addition action inserts an action into the order specified. Delete action removes any action it points to including, including other deletes, based on order. If the delete is outside the order available and it inserts a delete. Remember that for skipping the line one or more deletes need to be present
-    fn add_action(&mut self, action: ModificationAction, order: usize) {
-        let order = order.clamp(0, self.modifications.len());
-        match &action {
-            ModificationAction::Addition(_) => {
-                self.modifications.insert(order, action);
-            }
-            ModificationAction::Deletion => match self.modifications.get_mut(order) {
-                Some(_) => {
-                    self.modifications.remove(order);
-                }
-                None => {
-                    self.modifications.insert(order, action);
-                }
-            },
+            original_deleted: false,
         }
     }
 }
@@ -101,26 +95,132 @@ impl CastFile {
         })
     }
 
-    pub fn add_modification(
+    // todo enable adding chains instead of just individual actions
+    // todo have the result of this be used to inform the completion of actions and thus be used to inform action history of users for undo and redo
+    /// Addition action inserts an action into the order specified. Delete action removes any action it points to based on order. If the delete is outside the order available it swaps the original line from on to off.
+    pub fn action(
         &mut self,
-        byte_location: usize,
-        order: usize,
         action: ModificationAction,
-    ) {
-        match self.modifications.get_mut(&byte_location) {
-            Some(chain) => {
-                chain.add_action(action, order);
+        order: usize,
+        current_event: &EventPositioned,
+        // This is only needed for timing boundaries in the Addition action
+        previous_event: Option<&EventPositioned>,
+    ) -> Result<(), CastError> {
+        // Get or create the value at the current byte location
+        let entry = self
+            .modifications
+            .entry(current_event.byte_location)
+            .or_insert_with(ModificationChain::new);
+
+        let order = order.clamp(0, entry.modifications.len());
+        match action {
+            // As addition/insertion is between the current and previous event we can check them for time validity
+            ModificationAction::Addition(event) => {
+                if let Some(previous_event) = previous_event {
+                    if previous_event.event.time < event.time
+                        && event.time < current_event.event.time
+                    {
+                        entry.modifications.insert(order, event);
+                    } else {
+                        return Err(CastError::TimingError);
+                    }
+                } else {
+                    return Err(CastError::UnverifiableTime);
+                }
             }
-            None => {
-                let mut chain = ModificationChain::new();
-                chain.add_action(action, order);
-                self.modifications.insert(byte_location, chain);
+            ModificationAction::Deletion => match entry.modifications.get_mut(order) {
+                Some(_) => {
+                    entry.modifications.remove(order);
+                }
+                None => {
+                    // If order of delete falls out of range it flips deleting the original
+                    entry.original_deleted = !entry.original_deleted;
+                }
+            },
+            ModificationAction::ModifyData(event_data) => {
+                match entry.modifications.get_mut(order) {
+                    Some(event) => event.data = event_data,
+                    None => return Err(CastError::ModificationError),
+                }
             }
-        }
+        };
+        Ok(())
     }
 
-    pub fn get_chain(&self, byte_location: usize) -> Option<&ModificationChain> {
-        self.modifications.get(&byte_location)
+    // todo enable adding chains instead of just individual actions
+    // todo have the result of this be used to inform the completion of actions and thus be used to inform action history of users for undo and redo
+    /// Addition action inserts an action into the order specified. Delete action removes any action it points to based on order. If the delete is outside the order available it swaps the original line from on to off.
+    pub fn advanced_action(
+        &mut self,
+        action: AdvancedModificationAction,
+        order: usize,
+        current_event: &EventPositioned,
+        previous_event: Option<&EventPositioned>,
+        // todo change window to 3. Handle first by passing in 0 for first timing or f64 max for end timing. Change event position references to time values instead as that's all we're grabbing
+        next_event: Option<&EventPositioned>,
+    ) -> Result<(), CastError> {
+        // Get or create th value at the current byte location
+        let entry = self
+            .modifications
+            .entry(current_event.byte_location)
+            .or_insert_with(ModificationChain::new);
+
+        let order = order.clamp(0, entry.modifications.len());
+        match action {
+            AdvancedModificationAction::Modify(event) => {
+                if let Some(next_event) = next_event {
+                    if let Some(previous_event) = previous_event {
+                        // First action's is deleting what you're pointing to
+                        self.action(ModificationAction::Deletion, order, current_event, None)?;
+                        // Then we add an action that is the edited event into the topmost region of the next event. We know the topmost region will be order 0 as it addition prepends events sequentially in vector order, thus 0 is first
+                        self.action(
+                            ModificationAction::Addition(event),
+                            0,
+                            next_event,
+                            Some(previous_event),
+                        )?;
+                    } else {
+                        return Err(CastError::UnverifiableTime);
+                    }
+                } else {
+                    return Err(CastError::UnverifiableTime);
+                }
+            }
+            AdvancedModificationAction::Swap(target_event, target_order) => {
+                let current_data = current_event.event.data.clone();
+                let targeted_data = target_event.event.data.clone();
+                self.action(
+                    ModificationAction::ModifyData(targeted_data),
+                    order,
+                    current_event,
+                    None,
+                );
+                self.action(
+                    ModificationAction::ModifyData(current_data),
+                    target_order,
+                    &target_event,
+                    None,
+                );
+            }
+        };
+        Ok(())
+    }
+
+    // todo: We currently just assume that there will always be a requested time value due to the only modification of time being through the advanced modify action but we should likely have additional checks
+    /// This works on getting the order of the base events. It also operates under the presumption that *there are no duplicate time values for any event and that time events are ordered*. It returns either the order location or None if it is not present or there is no modification chain associated with that byte.
+
+    pub fn get_order(&self, byte_location: usize, base_event: &Event) -> usize {
+        self.modifications
+            .get(&byte_location)
+            // If no chain is found then return 0 as action can handle both if the chain exists or doesn't with the expected order of 0 for most behavior. When the first action order 0 works both for insertions and swapping the reading of the mmap event
+            .map_or(0, |chain| {
+                chain
+                    .modifications
+                    .iter()
+                    .position(|event| event.time == base_event.time)
+                    // ! If number isn't there then it should result in the maximum len of the chain. This allows delete on the original mmap event to work using similar syntax to other actions as the delete will target the len which necessarily flips if the original is being rendered.
+                    .unwrap_or(chain.modifications.len())
+            })
     }
 
     /// Gets `n` lines starting after the first encountered newline from `pos` (0.0 to 1.0) mapped to bytes of the file from 0 bytes to the end of the file. As it starts after the first newline the header is automatically excluded
@@ -175,23 +275,18 @@ impl CastFile {
         while current_pos < end_pos {
             match mod_iter.peek() {
                 Some((&mod_pos, chain)) if mod_pos == current_pos => {
-                    let next_newline = find_next_newline(&self.mmap, current_pos);
                     // byte location for all actions before any potential delete action alters it
                     let byte_location = current_pos;
-                    for action in chain.modifications.iter() {
-                        match action {
-                            ModificationAction::Addition(event) => {
-                                // Add the new event before current position so this is being pre-pended
-                                events.push(EventPositioned {
-                                    event: event.clone(),
-                                    byte_location,
-                                });
-                            }
-                            ModificationAction::Deletion => {
-                                // Skip this line. This makes it to where no matter how many deletes there are they always only skip one line at most
-                                current_pos = next_newline;
-                            }
-                        }
+                    for event in chain.modifications.clone() {
+                        // Add the new event before current position so this is being pre-pended
+                        events.push(EventPositioned {
+                            event,
+                            byte_location,
+                        });
+                    }
+                    if chain.original_deleted {
+                        // Skip this original line in the mmap
+                        current_pos = find_next_newline(&self.mmap, current_pos);
                     }
                     mod_iter.next(); // Move to next modification
                 }
@@ -220,6 +315,7 @@ impl CastFile {
         Ok(events)
     }
 
+    // !todo make it to where when you save to a file you remove the current cast file in memory and reconstruct a Cast file handle pointing to the new file to free memory used for in-memory action history
     pub fn save_to_file(&self, path: &Path) -> Result<(), CastError> {
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
@@ -252,19 +348,14 @@ impl CastFile {
             // Check if there's a modification at the current position
             match mod_iter.peek() {
                 Some((&mod_pos, chain)) if mod_pos == current_pos => {
-                    for action in chain.modifications.iter() {
-                        let next_newline = find_next_newline(&self.mmap, current_pos);
-                        match action {
-                            ModificationAction::Addition(event) => {
-                                // Write new event before current line
-                                let serialized = Self::serialize_event(&event)?;
-                                writer.write_all(&serialized)?;
-                            }
-                            ModificationAction::Deletion => {
-                                // Skip this line. This makes it to where no matter how many deletes there are they always only skip one line at most
-                                current_pos = next_newline;
-                            }
-                        }
+                    for event in chain.modifications.clone() {
+                        // Write new event before current line
+                        let serialized = Self::serialize_event(&event)?;
+                        writer.write_all(&serialized)?;
+                    }
+                    if chain.original_deleted {
+                        // Skip this original line in the mmap
+                        current_pos = find_next_newline(&self.mmap, current_pos);
                     }
                     mod_iter.next(); // Move to next modification
                 }
@@ -363,6 +454,15 @@ pub enum CastError {
 
     #[error("Memory mapping error: {0}")]
     MmapError(String),
+
+    #[error("Invalid timing modification request. Event timing must always be between the previous and next event, with a minimum value of 0")]
+    TimingError,
+
+    #[error("Invalid modification request. The order is likely out of bounds")]
+    ModificationError,
+
+    #[error("No contextualizing event was passed in thus timing boundaries are unverifiable")]
+    UnverifiableTime,
 }
 
 // Helper function to find next newline position without overwhelming memory usage

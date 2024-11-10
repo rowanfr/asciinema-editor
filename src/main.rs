@@ -185,7 +185,7 @@ impl MyEguiApp<'_> {
                                 line,
                                 event_position_window,
                             ) in events.windows(3).enumerate()
-                            
+                            // todo handle first element (as lines are inserted before the checks are last to first)
                             {
                                 let EventPositioned {
                                     event,
@@ -194,19 +194,27 @@ impl MyEguiApp<'_> {
                                 egui::ComboBox::from_id_salt(format!("button_{}", line))
                                     .selected_text("Choose...")
                                     .show_ui(ui, |ui| {
-                                        // todo pass in location
+                                        // ! Double check if unwrap or 0 handles all expected conditions
+                                        let order = self.cast_file.as_ref().expect("Unable to get the cast handle as mut for modification").get_order(*byte_location, event);
+
                                         if ui.button("Insert New Line Before This").clicked() {
-                                            self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").add_modification(
-                                                *byte_location,
-                                                0,
-                                                ModificationAction::Addition(Event { time: (event_position_window[0].event.time + event_position_window[2].event.time) / 2.0, data: EventData::Output("".to_string()) }),
+                                            // todo use the result from this to inform action history to enable undo and redo
+                                            let _ = self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").action(
+                                                ModificationAction::Addition(Event { time: (event_position_window[0].event.time + event.time) / 2.0, data: EventData::Output("".to_string()) }),
+                                                order,
+                                                &event_position_window[1],
+                                                Some(&event_position_window[0]),
+                                                
                                             );
                                         }
+                                        
                                         if ui.button("Delete").clicked() {
-                                            self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").add_modification(
-                                                *byte_location,
-                                                0,
+                                            // todo use the result from this to inform action history to enable undo and redo
+                                            let _ = self.cast_file.as_mut().expect("Unable to get the cast handle as mut for modification").action(
                                                 ModificationAction::Deletion,
+                                                order,
+                                                &event_position_window[1],
+                                                None,
                                             );
                                         }
                                     });
