@@ -1,6 +1,6 @@
 use crate::asciicast_egui::*;
 use eframe::egui::Color32;
-use memmap::Mmap;
+use memmap2::Mmap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
